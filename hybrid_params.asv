@@ -1,0 +1,62 @@
+function p = hybrid_params()
+% HYBRID_PARAMS — parameter struct for hybrid_pendulum (Case 1 & 2)
+
+%% --- Physical parameters (true plant) ----------------------------------
+p.m = 1.8;              % mass [kg]
+p.l = 0.6;              % length [m]
+p.k = 0.07;              % viscous damping
+p.g = 9.81;             % gravity
+
+%% --- Estimated parameters (baseline control) ---------------------------
+p.m_est = 1.0;
+p.l_est = 1.0;
+p.k_est = 0.1;
+
+%% --- Reference model gains (Soonyong style) ----------------------------
+% choose wn ~ sqrt(g/l), zeta ~ 0.7 as a reasonable default
+wn = sqrt(p.g/p.l);
+zeta = 0.7;
+p.kp = wn^2;
+p.kd = 2*zeta*wn;
+p.ki = 0.1;
+
+%% --- Adaptive gains ----------------------------------------------------
+p.Gamma_x = 10 * eye(2);   % for Kx
+p.Gamma_r = 20;            % for Kr
+p.Gamma_f = 10;            % for Ex_f_hat (case 1 scalar adaptation)
+
+%% --- Lyapunov matrices -------------------------------------------------
+p.Q = eye(2);
+A_ref = [0 1; -p.kp -p.kd];
+p.P = lyap(A_ref', p.Q);
+
+%% --- Transient channel -------------------------------------------------
+p.A_tran = diag([-2, -3]);     % \dot e_tran = A_tran e_tran
+
+%% --- Kernel/RKHS layer (used in architecture_mode >= 2) ----------------
+p.sigma  = 0.75;          % Gaussian kernel bandwidth
+p.r_min  = 0.10;          % min distance for new center sampling
+p.r_grid = 0.10;          % initial 9-point stencil spacing
+
+% --- Lyapunov and hybrid jump configuration (for architecture 3) --------
+if ~isfield(p, 'Q')
+    p.Q = eye(2);   % ensure Q exists
+end
+if ~isfield(p, 'P')
+    p.P = eye(2);   % ensure P exists
+end
+
+% V(e) = 0.5 * eᵀ P e   (Eq. 43)
+p.V_fun = @(e) 0.5 * (e(:)' * p.P * e(:));
+
+% W(ε) = λ_min(Q) * ||ε||²  (Eq. 44)
+lambda_min_Q = min(eig(p.Q));
+p.W_fun = @(eps) lambda_min_Q * (eps(:)' * eps(:));
+
+% Small default thresholds and period (used if not set already)
+if ~isfield(p, 'T_epoch'),       p.T_epoch = 5;     end
+if ~isfield(p, 'Tmax'),          p.Tmax = 40;       end
+if ~isfield(p, 'DeltaV_step_ref'),  p.DeltaV_step_ref  = 1e-3; end
+if ~isfield(p, 'DeltaW_step_tran'), p.DeltaW_step_tran = 1e-3; end
+
+end

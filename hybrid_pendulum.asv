@@ -1,0 +1,92 @@
+function dy = hybrid_pendulum(t, y, p)
+% HYBRID_PENDULUM — Case 1 (pure adaptive control, Soonyong-style)
+% States:
+%   y(1:2)   = x          = [theta; theta_dot]
+%   y(3:4)   = x_ref      = [theta_ref; theta_ref_dot]
+%   y(5:6)   = K_hat_x    (2x1)
+%   y(7)     = K_hat_r
+%   y(8)     = I_ref      = ∫(theta_ref - desired_output) dt
+%   y(9:10)  = e_tran     (our transient filter state)
+%   y(11)    = Ieps       = ∫ eᵀ Q e
+%   y(12)    = Itran      = ∫ e_tranᵀ Q e_tran
+
+% Unpack state
+x        = y(1:2);
+x_ref    = y(3:4);
+K_hat_x  = y(5:6);
+K_hat_r  = y(7);
+I_ref    = y(8);
+e_tran   = y(9:10);
+Ieps     = y(11); %#ok<NASGU>
+Itran    = y(12); %#ok<NASGU>
+
+% Shorthands
+m = p.m; l = p.l; k = p.k; g = p.g;
+m_est = p.m_est; l_est = p.l_est; k_est = p.k_est;
+
+kp = p.kp; kd = p.kd; ki = p.ki;
+Gamma_x = p.Gamma_x;      % 2x2
+Gamma_r = p.Gamma_r;      % scalar
+P = p.P;                  % 2x2
+Q = p.Q;                  % 2x2
+A_tran = p.A_tran;        % 2x2 stable
+
+% Desired reference (you set these function handles in main)
+yd   = p.desired_output(t);
+yd_d = p.desired_output_dot(t);
+
+% Reference model: x_ref_dot = A_ref x_ref + B_ref r
+A_ref = [0 1; -kp -kd];
+B_ref = [0; 1];
+
+% Soonyong PI-style r
+r = kp * yd - ki * I_ref;
+x_ref_dot = A_ref * x_ref + B_ref * r;
+
+% Tracking error
+e = x - x_ref;
+
+% Baseline control (Soonyong-style)
+theta = x(1); theta_dot = x(2);
+u_baseline = m_est*g*sin(theta) ...
+           + k_est*l_est*theta_dot ...
+           - m_est*l_est*( kp*(theta - yd) + kd*(theta_dot - yd_d) );
+
+% Adaptive control (no kernel in case 1 → Ex_f_hat = 0)
+Ex_f_hat  = 0;
+u_adaptive = (K_hat_x.' * x) + (K_hat_r * r) - Ex_f_hat;
+
+% Total control (SW_cont ignored per your request)
+u = u_baseline + u_adaptive;
+
+% Plant (linear-in-input with viscous damping; matched uncertainty channel set to zero)
+A = [0 1; 0 -k/m];
+B = [0; 1/(m*l)];
+Ex_f = 0;
+
+x_dot = A*x + B*(u + Ex_f);
+
+% Adaptive laws (Soonyong gradient form)
+PB = P * B;           % (2x1)
+K_hat_x_dot = - Gamma_x * (x * (e.' * PB));    % (2x2)*(2x1*1x1) -> (2x1)
+K_hat_r_dot = - Gamma_r * (r * (e.' * PB));    % scalar
+
+% Integral channels
+I_ref_dot  = (x_ref(1) - yd);   % Soonyong’s integral of ref error
+e_tran_dot = A_tran * e_tran;   % our transient filter
+
+% Lyapunov diagnostic integrals
+Ieps_dot  = e.' * Q * e;
+Itran_dot = e_tran.' * Q * e_tran;
+
+% Pack derivatives
+dy = zeros(size(y));
+dy(1:2)   = x_dot;
+dy(3:4)   = x_ref_dot;
+dy(5:6)   = K_hat_x_dot;
+dy(7)     = K_hat_r_dot;
+dy(8)     = I_ref_dot;
+dy(9:10)  = e_tran_dot;
+dy(11)    = Ieps_dot;
+dy(12)    = Itran_dot;
+end

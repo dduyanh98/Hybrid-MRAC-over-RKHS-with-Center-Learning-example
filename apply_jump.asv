@@ -1,0 +1,158 @@
+function [y_plus, p] = apply_jump(which_jump, t, y, p)
+% APPLY_JUMP  -- Hybrid jump map for:
+%   which_jump = 1 : epoch jump       (no state reset; kernel handled outside)
+%   which_jump = 2 : reference jump   (Eqn 46 / 52 style)
+%   which_jump = 3 : transient jump   (Eqn 48 / 53 style)
+%
+% State layout (pendulum version):
+%   y(1:2)   = x       (plant state)
+%   y(3:4)   = x_ref   (reference model state)
+%   y(9:10)  = e_tran  (transient error state)
+%   y(11)    = Ieps    = ∫ eᵀQe dt
+%   y(12)    = Itran   = ∫ εᵀQε dt
+%
+% where
+%   e   = x - x_ref
+%   eps = e - e_tran
+%
+% We use the same "series-element" style jump design as in
+% reference_reset_model / transient_reset_model (two_layer).
+
+persistent s_ref s_tran
+if isempty(s_ref),  s_ref  = 1; end
+if isempty(s_tran), s_tran = 1; end
+
+% ensure column
+y = y(:);
+
+% extract relevant states
+x      = y(1:2);
+x_ref  = y(3:4);
+e_tran = y(9:10);
+Ieps   = y(11);
+Itran  = y(12);
+
+% errors
+e   = x - x_ref;
+eps = e - e_tran;
+
+% default: no change
+y_plus = y;
+
+switch which_jump
+
+    % ==============================================================
+    % 1) EPOCH JUMP  (handled externally: kernel update, etc.)
+    % ==============================================================
+    case 1
+        % No reset of continuous states here; purely a "discrete-time"
+        % event for the kernel/quadtree logic outside.
+        % Just return.
+        return;
+
+
+    % ==============================================================
+    % 2) REFERENCE JUMP  (Two-layer analogue of reference_reset_model)
+    % ==============================================================
+    case 2
+        % weighted "error" at jump: use epsilon (auxiliary error)
+        weighted_eps_sq = eps.' * p.Q * eps;
+
+        % If degenerate, do nothing to avoid division by zero
+        if weighted_eps_sq <= 0
+            % Still log anchor & event time, but no geometric jump.
+            DeltaV = 0;
+        else
+            % Choose series index s_ref so that series_element(s_ref)
+            % is compatible with weighted_eps_sq (your find_s does that).
+            s_ref = find_s(s_ref, weighted_eps_sq);
+
+            % scalar "budget" assigned to this jump
+            sigma = series_element(s_ref);
+            % clip to [0, weighted_eps_sq] just for safety
+            sigma = max(0, min(sigma, weighted_eps_sq));
+
+            % scale factor as in the UAV two_layer code:
+            % jump_reference_state = (1 - sqrt((w - sigma)/w)) * epsilon
+            alpha = 1 - sqrt((weighted_eps_sq - sigma) / weighted_eps_sq);
+
+            jump_reference_state = alpha * eps;   % 2×1 for pendulum
+
+            % two-layer Eqn (52)-style:
+            %   x_ref^+ = x - e_tran - jump_reference_state
+            x_ref_plus = x - e_tran - jump_reference_state;
+
+            % Write back
+            y_plus(3:4) = x_ref_plus;
+
+            % For the pendulum there is no inner-loop split, so we don't
+            % need the y(7:8) hack from the UAV code.
+
+            % We associate ΔV for eqn (46) with this series element.
+            DeltaV = sigma;
+        end
+
+        % Update cumulative "budget" in p (used in event condition)
+        if ~isfield(p,'ref_budget_cum'), p.ref_budget_cum = 0; end
+        p.ref_budget_cum = p.ref_budget_cum + DeltaV;
+
+        % Anchor for ∫ eᵀQe (or ∫W(ε) depending on your definition)
+        p.Ieps_anchor = Ieps;
+
+        % Logging for plots
+        if ~isfield(p,'ref_jump_times'),    p.ref_jump_times    = []; end
+        if ~isfield(p,'DeltaV_hist'),       p.DeltaV_hist       = []; end
+        if ~isfield(p,'Ieps_anchor_hist'),  p.Ieps_anchor_hist  = []; end
+
+        p.ref_jump_times(end+1,1)   = t;
+        p.DeltaV_hist(end+1,1)      = DeltaV;
+        p.Ieps_anchor_hist(end+1,1) = Ieps;
+
+
+    % ==============================================================
+    % 3) TRANSIENT JUMP  (Two-layer analogue of transient_reset_model)
+    % ==============================================================
+    case 3
+        % weighted transient error at jump
+        weighted_e_tran_sq = e_tran.' * p.Q * e_tran;
+
+        if weighted_e_tran_sq <= 0
+            DeltaW = 0;
+        else
+            % choose index in the same series
+            s_tran = find_s(s_tran, weighted_e_tran_sq);
+
+            sigma_tran = series_element(s_tran);
+            sigma_tran = max(0, min(sigma_tran, weighted_e_tran_sq));
+
+            % In UAV code:
+            %   jump_tran_error = - sqrt((w - sigma)/w) * e_tran
+            beta = sqrt((weighted_e_tran_sq - sigma_tran) / weighted_e_tran_sq);
+            jump_tran_error = - beta * e_tran;
+
+            % New transient state is this jump vector
+            e_tran_plus = jump_tran_error;
+
+            y_plus(9:10) = e_tran_plus;
+
+            % For eqn (48) we'll take ΔW = sigma_tran
+            DeltaW = sigma_tran;
+        end
+
+        if ~isfield(p,'tran_budget_cum'), p.tran_budget_cum = 0; end
+        p.tran_budget_cum = p.tran_budget_cum + DeltaW;
+
+        % anchor for ∫ epsᵀQeps
+        p.Itran_anchor = Itran;
+
+        % Logging
+        if ~isfield(p,'tran_jump_times'),    p.tran_jump_times    = []; end
+        if ~isfield(p,'DeltaW_hist'),        p.DeltaW_hist        = []; end
+        if ~isfield(p,'Itran_anchor_hist'),  p.Itran_anchor_hist  = []; end
+
+        p.tran_jump_times(end+1,1)   = t;
+        p.DeltaW_hist(end+1,1)       = DeltaW;
+        p.Itran_anchor_hist(end+1,1) = Itran;
+end
+
+end

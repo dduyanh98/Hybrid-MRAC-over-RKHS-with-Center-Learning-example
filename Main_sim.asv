@@ -1,0 +1,643 @@
+% ========================================================================
+% HYBRID TWO-LAYER MRAC × LEARNING PENDULUM
+%   Mode 1: adaptive only          (no kernel, no jumps)
+%   Mode 2: epoch-only kernel      (no ref/transient jumps, static boxes)
+%   Mode 3: hybrid + quadtree      (all jumps + refinement + pruning)
+% ========================================================================
+
+addpath(genpath(pwd));
+clear all; clear functions; close all; clc;
+rng(0);
+
+
+% --- Problem setup ------------------------------------------------------
+p = hybrid_params();
+p.architecture_mode = 3;     % 1, 2, or 3
+
+%% --- Simulation settings -----------------------------------------------
+p.Tmax    = 10;      
+p.T_epoch = 0.1;    
+
+% --- Dictionary parameters ---------------------------------------------
+p.r0        = 5.0;
+p.gamma     = -0.1;
+p.rho       = 0.25;
+p.max_depth = 3;
+
+fprintf('\n========== HYBRID LEARNING SIMULATION ==========\n');
+
+% --- Reference signal ---------------------------------------------------
+freq = 1.5;
+p.desired_output     = @(t) deg2rad(45 + 5*sin(2*pi*freq*t));
+p.desired_output_dot = @(t) deg2rad(2*pi*freq*5*cos(2*pi*freq*t));
+
+% --- Initial states -----------------------------------------------------
+theta0    = deg2rad(10);
+thetadot0 = 0;
+x0     = [theta0; thetadot0];
+xref0  = [0; 0];
+Kx0    = [0; 0];
+Kr0    = 0;
+Iref0  = 0;
+e_tran0 = x0 - xref0;
+Ieps0   = 0;
+Itran0  = 0;
+Ex_f_hat0 = 0;
+X0 = [x0; xref0; Kx0; Kr0; Iref0; e_tran0; Ieps0; Itran0; Ex_f_hat0];
+
+% --- Kernel containers --------------------------------------------------
+Xi    = []; 
+alpha = []; 
+y_all = [];
+
+% --- Lyapunov budgets / anchors ----------------------------------------
+p.ref_budget_cum   = 0;
+p.tran_budget_cum  = 0;
+p.Ieps_anchor      = 0;
+p.Itran_anchor     = 0;
+p.DeltaV_step_ref  = 1e-3;  
+p.DeltaW_step_tran = 1e-3;
+p.t_last_epoch     = 0;
+
+% --- Logging ------------------------------------------------------------
+LOG.T = []; LOG.X = [];
+Xi_hist      = {};
+alpha_hist   = {};
+center_times = [];
+updates      = 0;
+
+% --- Quadtree initialization (only modes >= 2) --------------------------
+Boxes       = [];
+Xi_lib      = [];
+y_lib       = [];
+prevBoxID   = -1;
+stayCount   = 0;
+T_refine    = 3;
+
+if p.architecture_mode >= 2
+    theta_grid_deg = 0:10:60;         
+    thd_grid_deg   = -40:20:160;      
+    
+    % Convert to rad
+    theta_grid_rad = deg2rad(theta_grid_deg);
+    thd_grid_rad   = deg2rad(thd_grid_deg);
+
+    % Build library
+    [TH, THD] = ndgrid(theta_grid_rad, thd_grid_rad);
+    Xi_lib            = [TH(:), THD(:)];
+    n_lib             = size(Xi_lib,1);
+
+    y_lib = zeros(n_lib,1);
+    for i = 1:n_lib
+        y_lib(i) = regressor_vector(Xi_lib(i,:)'); % 
+    end
+
+    box_list = [];
+    for i = 1:(numel(theta_grid_rad)-1)
+        for j = 1:(numel(thd_grid_rad)-1)
+            b.theta_L = theta_grid_rad(i);
+            b.theta_R = theta_grid_rad(i+1);
+            b.d_D     = thd_grid_rad(j);
+            b.d_U     = thd_grid_rad(j+1);
+            b.center  = [(b.theta_L + b.theta_R)/2, ...
+                         (b.d_D     + b.d_U    )/2];
+
+            BL = sub2ind([7 11], i,   j);
+            BR = sub2ind([7 11], i+1, j);
+            TL = sub2ind([7 11], i,   j+1);
+            TR = sub2ind([7 11], i+1, j+1);
+            b.corner_idx = [BL; BR; TL; TR];
+
+            b.depth      = 0;
+            b.active     = true;
+            box_list = [box_list; b];
+        end
+    end
+    Boxes = box_list;
+end
+
+%% D
+% =======================================================================
+% ARCHITECTURE 1 (no jumps, no kernel)
+% =======================================================================
+if p.architecture_mode == 1
+    fprintf('Architecture 1: adaptive only\n');
+
+    opts = odeset('RelTol',1e-3,'AbsTol',1e-6);
+    [Tfull, Xfull] = ode45(@(t,x) hybrid_pendulum(t,x,p,[],[]), ...
+                           [0 p.Tmax], X0, opts);
+
+    LOG.T = Tfull;
+    LOG.X = Xfull;
+
+    fprintf('\n================================================\n');
+    fprintf('Simulation done (mode 1).\n');
+    fprintf('Kernel updates = 0\n');
+    fprintf('================================================\n');
+
+else
+% =======================================================================
+% ARCHITECTURES 2 & 3 — EVENT-BASED
+% =======================================================================
+    if p.architecture_mode == 2
+        fprintf('Architecture 2: epoch-only kernel\n');
+    else
+        fprintf('Architecture 3: full hybrid + quadtree kernel\n');
+    end
+
+    t0 = 0;
+    while t0 < p.Tmax
+
+        opts_ev = odeset('RelTol',1e-3, ...
+                         'AbsTol',1e-6*ones(length(X0),1), ...
+                         'Events', @(t,y) reference_transient_events(t,y,p));
+
+        [Tseg,Xseg,te,~,ie] = ode45(@(t,x) hybrid_pendulum(t,x,p,Xi,alpha), ...
+                                    [t0 p.Tmax], X0, opts_ev);
+
+        LOG.T = [LOG.T; Tseg];
+        LOG.X = [LOG.X; Xseg];
+
+        if isempty(ie) || Tseg(end) >= p.Tmax
+            break;
+        end
+
+        which   = ie(end);
+        t_event = te(end);
+
+        % --- Mode 2: ignore ref/trans (only epoch jump allowed)
+        if p.architecture_mode == 2 && which ~= 1
+            t0 = t_event;
+            X0 = Xseg(end,:)';
+            continue;
+        end
+
+        switch which
+            case 1
+                fprintf('t = %.2f → Epoch jump\n', t_event);
+            case 2
+                fprintf('t = %.2f → Reference jump\n', t_event);
+            case 3
+                fprintf('t = %.2f → Transient jump\n', t_event);
+        end
+
+        % --- Apply jump ------------------------------------------------
+        if which == 1 || p.architecture_mode == 3
+            [X_plus,p] = apply_jump(which, t_event, Xseg(end,:)', p);
+        else
+            X_plus = Xseg(end,:)';
+        end
+
+        % ----------------- KERNEL UPDATE (modes 2 and 3) --------------------
+        % Now: update kernel after *any* jump (epoch, ref, transient) in mode >= 2
+        if p.architecture_mode >= 2
+
+
+            x_rep = Xseg(end,1:2);
+            t_event_local = t_event;
+
+            [~, ~, BoxID0] = select_centers_from_library(x_rep, Xi_lib, y_lib, Boxes, p);
+
+            if BoxID0 == prevBoxID
+                stayCount = stayCount + 1;
+            else
+                stayCount = 1;
+            end
+            prevBoxID = BoxID0;
+
+            if p.architecture_mode == 3
+                if stayCount >= T_refine && Boxes(BoxID0).depth < p.max_depth
+                    fprintf('    Refining box %d (depth=%d)\n', BoxID0, Boxes(BoxID0).depth);
+                    [Boxes, Xi_lib, y_lib] = refine_box(Boxes, BoxID0, Xi_lib, y_lib, p);
+                    [Xi_new, y_new, BoxID] = select_centers_from_library( ...
+                        x_rep, Xi_lib, y_lib, Boxes, p);
+                else
+                    [Xi_new, y_new, BoxID] = select_centers_from_library( ...
+                        x_rep, Xi_lib, y_lib, Boxes, p);
+                end
+
+                Boxes = prune_boxes(x_rep, Boxes, t_event_local, p, BoxID);
+                n_active = sum([Boxes.active]);
+                fprintf('    Using box %d (depth=%d), active=%d\n', ...
+                        BoxID, Boxes(BoxID).depth, n_active);
+
+            else
+                [Xi_new, y_new, BoxID] = select_centers_from_library( ...
+                    x_rep, Xi_lib, y_lib, Boxes, p);
+                fprintf('    Using box %d (depth=%d)\n', ...
+                        BoxID, Boxes(BoxID).depth);
+            end
+
+            Xi    = Xi_new;
+            y_all = y_new;
+            lambda = 1e-9;
+            [alpha,~,~] = kernel_regression(Xi, Xi, y_all, p.sigma, lambda);
+
+            updates             = updates + 1;
+            Xi_hist{updates}    = Xi;
+            alpha_hist{updates} = alpha;
+            center_times(end+1) = t_event;
+        end
+        % ===================================================================
+
+        if which == 1
+            p.t_last_epoch = t_event;
+        end
+
+        t0 = t_event;
+        X0 = X_plus;
+        if t0 >= p.Tmax, break; end
+    end
+
+    fprintf('\n================================================\n');
+    fprintf('Simulation done (mode %d).\n', p.architecture_mode);
+    fprintf('Total kernel updates = %d\n', updates);
+    fprintf('================================================\n');
+
+end
+
+% =======================================================================
+% POST–PROCESSING & PLOTS  (CLEAN + CONSISTENT)
+% =======================================================================
+T = LOG.T; 
+X = LOG.X;
+N = length(T);
+
+% State extraction
+x      = X(:,1:2);
+xref   = X(:,3:4);
+Kx     = X(:,5:6);
+Kr     = X(:,7);
+Iref   = X(:,8);
+e_tran = X(:,9:10);
+Ieps   = X(:,11);       % ∫ W(ε)
+Itran  = X(:,12);       % ∫ W(e_tran)
+Ex_f_hat_state = X(:,13);
+
+% Errors
+e   = x - xref;
+eps = e - e_tran;
+
+theta     = x(:,1);
+theta_dot = x(:,2);
+theta_ref     = xref(:,1);
+theta_ref_dot = xref(:,2);
+
+% =======================================================================
+% BASIC TRAJECTORY PLOTS
+% =======================================================================
+figure('Color','w');
+plot(T, rad2deg(theta),'k','LineWidth',1.5); hold on;
+plot(T, rad2deg(theta_ref),'r--','LineWidth',1.5);
+xlabel('Time [s]'); ylabel('\theta [deg]');
+legend('\theta','\theta_{ref}'); grid on;
+title('Tracking of \theta');
+
+figure('Color','w');
+plot(T, rad2deg(theta_dot),'k','LineWidth',1.5); hold on;
+plot(T, rad2deg(theta_ref_dot),'r--','LineWidth',1.5);
+xlabel('Time [s]'); ylabel('\thetȧ [deg/s]');
+legend('\thetȧ','\thetȧ_{ref}'); grid on;
+title('Tracking of \thetȧ');
+
+% =======================================================================
+% CONTROL DECOMPOSITION
+% =======================================================================
+u          = zeros(N,1);
+u_baseline = zeros(N,1);
+u_adaptive = zeros(N,1);
+
+for i = 1:N
+    t = T(i);
+    yd   = p.desired_output(t);
+    yd_d = p.desired_output_dot(t);
+
+    xi    = x(i,:)';
+    Kx_i  = Kx(i,:)';
+    Kr_i  = Kr(i);
+    Iref_i= Iref(i);
+
+    u_bl = p.m_est*p.g*sin(xi(1)) + p.k_est*p.l_est*xi(2) ...
+          - p.m_est*p.l_est*(p.kp*(xi(1)-yd) + p.kd*(xi(2)-yd_d));
+
+    % kernel snapshot if available
+    if ~isempty(center_times)
+        idx = find(center_times <= t, 1, 'last');
+    else
+        idx = [];
+    end
+
+    if ~isempty(idx) && idx <= numel(Xi_hist)
+        Ex_f_hat_i = kernel_prediction(xi', Xi_hist{idx}, alpha_hist{idx}, p.sigma, 1);
+    else
+        Ex_f_hat_i = Ex_f_hat_state(i);
+    end
+
+    r_i = p.kp*yd - p.ki*Iref_i;
+    u_ad = Kx_i'*xi + Kr_i*r_i - Ex_f_hat_i;
+
+    u(i)          = u_bl + u_ad;
+    u_baseline(i) = u_bl;
+    u_adaptive(i) = u_ad;
+end
+
+figure('Color','w');
+plot(T,u,'k','LineWidth',1.8); hold on;
+plot(T,u_baseline,'r--','LineWidth',1.3);
+plot(T,u_adaptive,'b:','LineWidth',1.8);
+ylabel('Control Input u');
+xlabel('Time [s]');
+legend('u_{total}','u_{baseline}','u_{adaptive}');
+grid on; title('Control Effort Decomposition');
+
+% =======================================================================
+% PHASE PORTRAIT + CENTER EVOLUTION
+% =======================================================================
+figure('Color','w');
+plot(rad2deg(theta), rad2deg(theta_dot),'k','LineWidth',1.5); hold on;
+plot(rad2deg(theta_ref), rad2deg(theta_ref_dot),'r--','LineWidth',1.2);
+xlabel('\theta [deg]');
+ylabel('\thetȧ [deg/s]');
+legend('Actual','Reference');
+grid on; title('Phase Portrait');
+
+% ---- Overlay center locations (if any) --------------------------------
+if p.architecture_mode >= 2 && ~isempty(Xi)
+    plot(rad2deg(Xi(:,1)), rad2deg(Xi(:,2)), 'bo', ...
+         'MarkerFaceColor','c', 'MarkerSize',7, ...
+         'DisplayName','Centers');
+    for j = 1:size(Xi,1)
+        text(rad2deg(Xi(j,1)) + 0.5, rad2deg(Xi(j,2)), sprintf('%d', j), ...
+            'FontSize',8, 'Color','b');
+    end
+    legend('show','Location','best');
+end
+
+% ---- Overlay evolution of 4 centers used per update --------------------
+if ~isempty(Xi_hist)
+    cmap = lines(numel(Xi_hist));
+    for k = 1:numel(Xi_hist)
+        Xi_k = Xi_hist{k};   % 4×2
+        plot(rad2deg(Xi_k(:,1)), rad2deg(Xi_k(:,2)), 'o', ...
+             'MarkerSize',6,'Color',cmap(k,:));
+
+        % place label at average of 4 centers
+        xc = mean(rad2deg(Xi_k(:,1)));
+        yc = mean(rad2deg(Xi_k(:,2)));
+        text(xc, yc, sprintf('%d',k), 'FontSize',7,'Color',cmap(k,:));
+    end
+end
+
+
+% =======================================================================
+% OVERLAY CENTER TIMES (if any)
+% =======================================================================
+if ~isempty(center_times)
+    figs = [1 2 3];
+    for f = figs
+        figure(f); hold on;
+        for s = 1:length(center_times)
+            xline(center_times(s),'k--','LineWidth',0.8,'HandleVisibility','off');
+        end
+        xline(NaN,'k--','DisplayName','Kernel Update'); % legend handle
+    end
+end
+
+% =======================================================================
+% COMPUTE LYAPUNOV QUANTITIES (CLEAN VERSION)
+% =======================================================================
+Gamma = blkdiag(p.Gamma_x, p.Gamma_r);
+
+theta_vec = [Kx, Kr];  % (N × 3)
+
+V_eps        = zeros(N,1);  % εᵀ P ε
+V_theta      = zeros(N,1);  % θ-parameter error term
+V_main       = zeros(N,1);  % V = εᵀ P ε + θᵀ Γ^{-1} θ
+V_ref_monitor  = zeros(N,1); 
+V_tran_monitor = zeros(N,1);
+
+if isfield(p,'ref_jump_times') && ~isempty(p.ref_jump_times)
+    ref_times   = p.ref_jump_times(:);
+else
+    ref_times   = [];
+end
+
+if isfield(p,'Ieps_anchor_hist') && ~isempty(p.Ieps_anchor_hist)
+    ref_anchors = p.Ieps_anchor_hist(:);
+else
+    ref_anchors = [];
+end
+
+if isfield(p,'tran_jump_times') && ~isempty(p.tran_jump_times)
+    tran_times  = p.tran_jump_times(:);
+else
+    tran_times  = [];
+end
+
+if isfield(p,'Itran_anchor_hist') && ~isempty(p.Itran_anchor_hist)
+    tran_anchors = p.Itran_anchor_hist(:);
+else
+    tran_anchors = [];
+end
+
+
+ref_idx = 0; 
+tran_idx = 0;
+ref_anchor = 0;
+tran_anchor = 0;
+tol = 1e-9;
+
+for i = 1:N
+    eps_i    = eps(i,:)';
+    e_tran_i = e_tran(i,:)';
+    theta_err= theta_vec(i,:)';
+
+    V_eps(i)   = eps_i' * p.P * eps_i;
+    V_theta(i) = theta_err' * (Gamma \ theta_err);
+    V_main(i)  = V_eps(i) + V_theta(i);
+
+    t_i = T(i);
+
+    % update reference anchor
+    if ~isempty(ref_times)
+        while ref_idx+1 <= numel(ref_times) && t_i >= ref_times(ref_idx+1)-tol
+            ref_idx = ref_idx+1;
+            ref_anchor = ref_anchors(ref_idx);
+        end
+    end
+
+    % update transient anchor
+    if ~isempty(tran_times)
+        while tran_idx+1 <= numel(tran_times) && t_i >= tran_times(tran_idx+1)-tol
+            tran_idx = tran_idx+1;
+            tran_anchor = tran_anchors(tran_idx);
+        end
+    end
+
+    V_ref_monitor(i)  = Ieps(i)  - ref_anchor; 
+    V_tran_monitor(i) = Itran(i) - tran_anchor;
+end
+
+% =======================================================================
+% FIGURE 5 — MAIN LYAPUNOV FUNCTION
+% =======================================================================
+figure('Color','w');
+semilogy(T, V_main,'k','LineWidth',1.5);
+xlabel('Time [s]'); ylabel('V_{main}');
+title('Main Lyapunov Function');
+grid on;
+
+% % FIGURE 6 — Eq (46): global integral from t0
+% figure('Color','w'); hold on;
+% plot(T, Ieps, 'k-', 'LineWidth', 1.5);   % <--- use Ieps directly
+% 
+% 
+% hasDV = isfield(p,'DeltaV_hist') && ~isempty(p.DeltaV_hist);
+% if hasDV
+%     tJ = p.ref_jump_times(:);
+%     DV = p.DeltaV_hist(:);
+%     RHS = [0; cumsum(DV)] + p.DeltaV_step_ref;
+%     stairs([tJ; T(end)], RHS,'r','LineWidth',1.6);
+%     for t0 = tJ'; xline(t0,'r--'); end
+% else
+%     stairs([T(1);T(end)], [p.DeltaV_step_ref; p.DeltaV_step_ref],'r','LineWidth',1.6);
+% end
+% 
+% xlabel('Time [s]');
+% ylabel('Eq. 46 terms');
+% legend('LHS = ∫W(ε)', 'RHS = ΣΔV + ΔV_{step}');
+% title('Reference Reset Trigger Condition');
+% grid on;
+
+% =======================================================================
+% CORRECTED FIGURE 6 — EXACT EVENT QUANTITIES (Eq. 46)
+% =======================================================================
+
+figure('Color','w'); hold on;
+
+% (1) True LHS used by event: GLOBAL integral
+lhs_ref_event = Ieps;
+plot(T, lhs_ref_event, 'k-', 'LineWidth', 1.8);
+
+% Extract jump info
+if isfield(p,'ref_jump_times') && ~isempty(p.ref_jump_times)
+    ref_times = p.ref_jump_times(:);
+else
+    ref_times = [];
+end
+
+if isfield(p,'DeltaV_hist') && ~isempty(p.DeltaV_hist)
+    DV = p.DeltaV_hist(:);
+else
+    DV = [];
+end
+
+% (2) True RHS reconstruction
+rhs_ref_event = zeros(N,1);
+ref_idx = 0;
+cumDV   = 0;
+
+for i = 1:N
+    t_i = T(i);
+
+    % Update cumulative ΔV when passing jump times
+    while ref_idx < numel(ref_times) && t_i >= ref_times(ref_idx+1) - 1e-12
+        ref_idx = ref_idx + 1;
+        cumDV   = cumDV + DV(ref_idx);
+    end
+
+    rhs_ref_event(i) = cumDV + p.DeltaV_step_ref;
+end
+
+% Stair plot of RHS
+stairs(T, rhs_ref_event, 'r-', 'LineWidth', 1.6);
+
+% Plot vertical reset lines
+for t0 = ref_times'
+    xline(t0, 'r--', 'LineWidth', 1.1);
+end
+
+xlabel('Time [s]');
+ylabel('Eq. 46 Quantities');
+legend('LHS = I_{eps} (global)', 'RHS = ΣΔV + ΔV_{step}');
+title('Corrected Reference Reset Trigger Condition (Exact Event Signals)');
+grid on;
+
+
+
+% % =======================================================================
+% % FIGURE 7 — Eq (48): Transient Reset Trigger
+% % =======================================================================
+% figure('Color','w'); hold on;
+% plot(T, Itran, 'k-', 'LineWidth', 1.5);  % <--- use Itran directly
+% 
+% 
+% hasDW = isfield(p,'DeltaW_hist') && ~isempty(p.DeltaW_hist);
+% if hasDW
+%     tJ = p.tran_jump_times(:);
+%     DW = p.DeltaW_hist(:);
+%     RHS = [0; cumsum(DW)] + p.DeltaW_step_tran;
+%     stairs([tJ; T(end)], RHS,'b','LineWidth',1.6);
+%     for t0 = tJ'; xline(t0,'b--'); end
+% else
+%     stairs([T(1);T(end)], [p.DeltaW_step_tran; p.DeltaW_step_tran],'b','LineWidth',1.6);
+% end
+% 
+% xlabel('Time [s]');
+% ylabel('Eq. 48 terms');
+% legend('LHS = ∫W(e_{tran})', 'RHS = ΣΔW + ΔW_{step}');
+% title('Transient Reset Trigger Condition');
+% grid on;
+
+% =======================================================================
+% CORRECTED FIGURE 7 — EXACT EVENT QUANTITIES (Eq. 48)
+% =======================================================================
+
+figure('Color','w'); hold on;
+
+% (1) True LHS used in event: GLOBAL ∫ W(e_tran)
+lhs_tran_event = Itran;
+plot(T, lhs_tran_event, 'k-', 'LineWidth', 1.8);
+
+% Extract jump info
+if isfield(p,'tran_jump_times') && ~isempty(p.tran_jump_times)
+    tran_times = p.tran_jump_times(:);
+else
+    tran_times = [];
+end
+
+if isfield(p,'DeltaW_hist') && ~isempty(p.DeltaW_hist)
+    DW = p.DeltaW_hist(:);
+else
+    DW = [];
+end
+
+% (2) Reconstruct RHS
+rhs_tran_event = zeros(N,1);
+tran_idx = 0;
+cumDW   = 0;
+
+for i = 1:N
+    t_i = T(i);
+
+    while tran_idx < numel(tran_times) && t_i >= tran_times(tran_idx+1) - 1e-12
+        tran_idx = tran_idx + 1;
+        cumDW    = cumDW + DW(tran_idx);
+    end
+
+    rhs_tran_event(i) = cumDW + p.DeltaW_step_tran;
+end
+
+stairs(T, rhs_tran_event, 'b-', 'LineWidth', 1.6);
+
+% Mark events
+for t0 = tran_times'
+    xline(t0, 'b--', 'LineWidth', 1.1);
+end
+
+xlabel('Time [s]');
+ylabel('Eq. 48 Quantities');
+legend('LHS = I_{tran} (global)', 'RHS = ΣΔW + ΔW_{step}');
+title('Corrected Transient Reset Trigger Condition (Exact Event Signals)');
+grid on;
+
